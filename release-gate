@@ -117,9 +117,13 @@ def wait_ready(name, version):
             "inspect", "-f", "{{.State.Running}}", name
         ).stdout.strip()
         if running != "true":
+            state = docker(
+                "inspect", "-f",
+                "exit={{.State.ExitCode}} oom={{.State.OOMKilled}}", name,
+            ).stdout.strip()
             logs = docker("logs", "--tail", "40", name, check=False)
             raise GateFailure(
-                f"{name} stopped before it was ready:\n"
+                f"{name} stopped before it was ready ({state}):\n"
                 f"{logs.stdout[-3000:]}{logs.stderr[-3000:]}"
             )
         try:
@@ -252,7 +256,10 @@ def main():
         raise GateFailure(f"{image} is {arch}, expected linux/amd64")
 
     run_id = secrets.token_hex(4)
-    work = Path(tempfile.mkdtemp(prefix="mattermost-gate."))
+    # Keep test data on disk next to the build context. Files written to a
+    # tmpfs /tmp count against the container's memory limit and get the
+    # test container OOM-killed, which never happens on Cylo storage.
+    work = Path(tempfile.mkdtemp(prefix=".mattermost-gate.", dir=Path.cwd()))
     names = []
     try:
         print("Fresh install", flush=True)
