@@ -5,8 +5,9 @@ Usage: ./release-gate repo.cylo.net/mattermost:<version>
 
 Run on the builder after `docker build` and before `docker push`. Exits 0
 only when the local image passes a fresh install, a restart, and an upgrade
-from the current production image on the same data, and the registry
-positively reports that the tag does not exist yet. Any other result,
+from the current production image on the same data, with every restart
+facing the stale Postgres lock file a killed container leaves behind, and
+the registry positively reports that the tag does not exist yet. Any other result,
 including an unreachable or ambiguous registry, exits non-zero.
 """
 
@@ -35,6 +36,7 @@ BASELINE_VERSION = "11.3.0"
 # Matches the catalogue limits for the app (2 GB memory, no extra swap).
 MEMORY_LIMIT = "2g"
 START_TIMEOUT = 900
+STALE_LOCK = 'lock file "postmaster.pid" already exists'
 IMAGE_RE = re.compile(
     r"^repo\.cylo\.net/mattermost:(?P<version>\d+\.\d+\.\d+)(?:-\d+)?$"
 )
@@ -70,6 +72,26 @@ def start(image, name, data_dir):
 def stop(name):
     docker("stop", "-t", "60", name)
     docker("rm", name)
+
+
+def leave_stale_lock(data_dir):
+    """Point postmaster.pid at a live process, as a killed container can.
+
+    Stopping the container kills Postgres without a clean shutdown, so its
+    lock file stays behind. Whether the old PID is in use on the next start
+    depends on timing; PID 1 (the container's init) always is, which makes
+    the check deterministic.
+    """
+    pid_file = data_dir / "pg" / "postmaster.pid"
+    lines = pid_file.read_text().splitlines() if pid_file.exists() else []
+    pid_file.write_text("\n".join(["1"] + lines[1:]) + "\n")
+
+
+def restart(name, data_dir, version):
+    docker("stop", "-t", "60", name)
+    leave_stale_lock(data_dir)
+    docker("start", name)
+    wait_ready(name, version)
 
 
 def container_ip(name):
@@ -126,6 +148,9 @@ def wait_ready(name, version):
                 f"{name} stopped before it was ready ({state}):\n"
                 f"{logs.stdout[-3000:]}{logs.stderr[-3000:]}"
             )
+        logs = docker("logs", "--tail", "50", name, check=False)
+        if STALE_LOCK in logs.stdout + logs.stderr:
+            raise GateFailure(f"{name}: Postgres refused a stale lock file")
         try:
             status, headers, payload = api(
                 container_ip(name), "GET", "/system/ping"
@@ -271,8 +296,7 @@ def main():
         start(image, name, fresh)
         wait_ready(name, version)
         seeded = seed(container_ip(name))
-        docker("restart", "-t", "60", name)
-        wait_ready(name, version)
+        restart(name, fresh, version)
         verify(container_ip(name), seeded)
         stop(name)
 
@@ -287,13 +311,13 @@ def main():
         wait_ready(name, BASELINE_VERSION)
         seeded = seed(container_ip(name))
         stop(name)
+        leave_stale_lock(upgrade)
         name = f"mm-gate-{run_id}-upgraded"
         names.append(name)
         start(image, name, upgrade)
         wait_ready(name, version)
         verify(container_ip(name), seeded)
-        docker("restart", "-t", "60", name)
-        wait_ready(name, version)
+        restart(name, upgrade, version)
         verify(container_ip(name), seeded)
         stop(name)
 

@@ -3,6 +3,10 @@
 # See License.txt for license information.
 
 echo "Starting Postgres"
+# Postgres is never running when the container starts, so a postmaster.pid
+# left by a container that was killed is stale. Postgres refuses to start if
+# the PID in it now belongs to another process in this container.
+rm -f /var/lib/postgresql/data/postmaster.pid
 mkdir -p /mm /var/lib/postgresql/data /var/run/postgresql
 chown -R 1000:1000 /mm /var/lib/postgresql /var/run/postgresql
 gosu 1000:1000 /usr/local/bin/docker-entrypoint.sh postgres &
