@@ -1,0 +1,310 @@
+#!/usr/bin/env python3
+"""Release gate for the Appbox Mattermost image.
+
+Usage: ./release-gate repo.cylo.net/mattermost:<version>
+
+Run on the builder after `docker build` and before `docker push`. Exits 0
+only when the local image passes a fresh install, a restart, and an upgrade
+from the current production image on the same data, and the registry
+positively reports that the tag does not exist yet. Any other result,
+including an unreachable or ambiguous registry, exits non-zero.
+"""
+
+import http.client
+import json
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.error
+import urllib.request
+from pathlib import Path
+
+REGISTRY = "repo.cylo.net"
+REPOSITORY = "mattermost"
+# The 11.3.0 image customers run today (published as :latest), pinned by
+# digest so the upgrade test always starts from the same release.
+BASELINE_IMAGE = (
+    "repo.cylo.net/mattermost@sha256:"
+    "a480b8c206102379058e397d7b66cfcb0cccf2916170cc25b3e34c23ab083c29"
+)
+BASELINE_VERSION = "11.3.0"
+# Matches the catalogue limits for the app (2 GB memory, no extra swap).
+MEMORY_LIMIT = "2g"
+START_TIMEOUT = 900
+IMAGE_RE = re.compile(
+    r"^repo\.cylo\.net/mattermost:(?P<version>\d+\.\d+\.\d+)(?:-\d+)?$"
+)
+
+
+class GateFailure(Exception):
+    pass
+
+
+def docker(*args, check=True):
+    result = subprocess.run(
+        ["docker", *args], capture_output=True, text=True, check=False
+    )
+    if check and result.returncode != 0:
+        raise GateFailure(
+            f"docker {' '.join(args[:2])} failed: {result.stderr.strip()}"
+        )
+    return result
+
+
+def start(image, name, data_dir):
+    docker(
+        "run", "-d", "--name", name, "--init",
+        "--memory", MEMORY_LIMIT, "--memory-swap", MEMORY_LIMIT,
+        # Send the install callback nowhere instead of to production.
+        "--add-host", "api.cylo.io:127.0.0.1",
+        "-v", f"{data_dir / 'mm'}:/mm",
+        "-v", f"{data_dir / 'pg'}:/var/lib/postgresql/data",
+        image,
+    )
+
+
+def stop(name):
+    docker("stop", "-t", "60", name)
+    docker("rm", name)
+
+
+def container_ip(name):
+    out = docker(
+        "inspect", "-f",
+        "{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}", name,
+    ).stdout.strip()
+    if not out:
+        raise GateFailure(f"{name} has no IP address")
+    return out
+
+
+def api(ip, method, path, body=None, token=None):
+    data = json.dumps(body).encode() if body is not None else None
+    req = urllib.request.Request(
+        f"http://{ip}/api/v4{path}", data=data, method=method
+    )
+    req.add_header("Content-Type", "application/json")
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read()
+            return resp.status, resp.headers, json.loads(raw) if raw else None
+    except urllib.error.HTTPError as err:
+        raw = err.read()
+        try:
+            payload = json.loads(raw) if raw else None
+        except ValueError:
+            payload = None
+        return err.code, err.headers, payload
+
+
+def expect(status, wanted, what, payload):
+    if status != wanted:
+        detail = (payload or {}).get("id") if isinstance(payload, dict) else None
+        raise GateFailure(f"{what}: HTTP {status} ({detail})")
+
+
+def wait_ready(name, version):
+    deadline = time.monotonic() + START_TIMEOUT
+    last = "no response"
+    while time.monotonic() < deadline:
+        running = docker(
+            "inspect", "-f", "{{.State.Running}}", name
+        ).stdout.strip()
+        if running != "true":
+            logs = docker("logs", "--tail", "40", name, check=False)
+            raise GateFailure(
+                f"{name} stopped before it was ready:\n"
+                f"{logs.stdout[-3000:]}{logs.stderr[-3000:]}"
+            )
+        try:
+            status, headers, payload = api(
+                container_ip(name), "GET", "/system/ping"
+            )
+            served = headers.get("X-Version-Id", "")
+            if status == 200 and payload and payload.get("status") == "OK":
+                if not served.startswith(version + "."):
+                    raise GateFailure(
+                        f"{name} serves {served!r}, expected {version}"
+                    )
+                print(f"  {name} ready: {served}", flush=True)
+                return
+            last = f"HTTP {status}"
+        except (OSError, ValueError, http.client.HTTPException) as err:
+            last = str(err)
+        time.sleep(5)
+    raise GateFailure(f"{name} not ready after {START_TIMEOUT}s: {last}")
+
+
+def seed(ip):
+    """Create the first admin, a team and a post through the public API."""
+    suffix = secrets.token_hex(4)
+    account = {
+        "username": f"gate{suffix}",
+        "email": f"gate{suffix}@example.com",
+        "password": secrets.token_urlsafe(18) + "aA1!",
+    }
+    status, _, payload = api(ip, "POST", "/users", account)
+    expect(status, 201, "create first user", payload)
+    token = login(ip, account)
+    status, _, team = api(
+        ip, "POST", "/teams",
+        {"name": f"gate{suffix}", "display_name": "Gate", "type": "O"}, token,
+    )
+    expect(status, 201, "create team", team)
+    status, _, channel = api(
+        ip, "GET", f"/teams/{team['id']}/channels/name/town-square",
+        token=token,
+    )
+    expect(status, 200, "find town-square", channel)
+    message = f"release gate {suffix}"
+    status, _, post = api(
+        ip, "POST", "/posts",
+        {"channel_id": channel["id"], "message": message}, token,
+    )
+    expect(status, 201, "create post", post)
+    return {
+        "account": account,
+        "team": team["name"],
+        "post_id": post["id"],
+        "message": message,
+    }
+
+
+def login(ip, account):
+    status, headers, payload = api(
+        ip, "POST", "/users/login",
+        {"login_id": account["username"], "password": account["password"]},
+    )
+    expect(status, 200, "log in", payload)
+    token = headers.get("Token")
+    if not token:
+        raise GateFailure("log in returned no session token")
+    return token
+
+
+def verify(ip, seeded):
+    token = login(ip, seeded["account"])
+    status, _, team = api(ip, "GET", f"/teams/name/{seeded['team']}", token=token)
+    expect(status, 200, "read team", team)
+    status, _, post = api(ip, "GET", f"/posts/{seeded['post_id']}", token=token)
+    expect(status, 200, "read post", post)
+    if post.get("message") != seeded["message"]:
+        raise GateFailure("post content changed")
+
+
+def registry_tag_absent(tag):
+    config = json.loads((Path.home() / ".docker" / "config.json").read_text())
+    auth = config.get("auths", {}).get(REGISTRY, {}).get("auth")
+    if not auth:
+        raise GateFailure(f"no stored credentials for {REGISTRY}")
+    req = urllib.request.Request(
+        f"https://{REGISTRY}/v2/{REPOSITORY}/manifests/{tag}",
+        headers={
+            "Authorization": f"Basic {auth}",
+            "Accept": ",".join([
+                "application/vnd.oci.image.index.v1+json",
+                "application/vnd.oci.image.manifest.v1+json",
+                "application/vnd.docker.distribution.manifest.list.v2+json",
+                "application/vnd.docker.distribution.manifest.v2+json",
+            ]),
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            digest = resp.headers.get("Docker-Content-Digest")
+            raise GateFailure(
+                f"{REGISTRY}/{REPOSITORY}:{tag} already exists ({digest})"
+            )
+    except urllib.error.HTTPError as err:
+        if err.code != 404:
+            raise GateFailure(f"registry check indeterminate: HTTP {err.code}")
+        try:
+            codes = {e.get("code") for e in json.loads(err.read())["errors"]}
+        except (ValueError, KeyError, TypeError):
+            raise GateFailure("registry check indeterminate: unreadable 404")
+        if not codes & {"MANIFEST_UNKNOWN", "NAME_UNKNOWN"}:
+            raise GateFailure(f"registry check indeterminate: {sorted(codes)}")
+    except urllib.error.URLError as err:
+        raise GateFailure(f"registry check indeterminate: {err.reason}")
+    print(f"  {REGISTRY}/{REPOSITORY}:{tag} is not in the registry", flush=True)
+
+
+def main():
+    if len(sys.argv) != 2:
+        raise GateFailure("usage: release-gate <image-reference>")
+    image = sys.argv[1]
+    match = IMAGE_RE.match(image)
+    if not match:
+        raise GateFailure(f"unexpected image reference: {image!r}")
+    version = match["version"]
+    tag = image.split(":", 1)[1]
+
+    arch = docker(
+        "image", "inspect", "-f", "{{.Os}}/{{.Architecture}}", image
+    ).stdout.strip()
+    if arch != "linux/amd64":
+        raise GateFailure(f"{image} is {arch}, expected linux/amd64")
+
+    run_id = secrets.token_hex(4)
+    work = Path(tempfile.mkdtemp(prefix="mattermost-gate."))
+    names = []
+    try:
+        print("Fresh install", flush=True)
+        fresh = work / "fresh"
+        (fresh / "mm").mkdir(parents=True)
+        (fresh / "pg").mkdir()
+        name = f"mm-gate-{run_id}-fresh"
+        names.append(name)
+        start(image, name, fresh)
+        wait_ready(name, version)
+        seeded = seed(container_ip(name))
+        docker("restart", "-t", "60", name)
+        wait_ready(name, version)
+        verify(container_ip(name), seeded)
+        stop(name)
+
+        print(f"Upgrade from {BASELINE_VERSION}", flush=True)
+        docker("pull", "-q", BASELINE_IMAGE)
+        upgrade = work / "upgrade"
+        (upgrade / "mm").mkdir(parents=True)
+        (upgrade / "pg").mkdir()
+        name = f"mm-gate-{run_id}-baseline"
+        names.append(name)
+        start(BASELINE_IMAGE, name, upgrade)
+        wait_ready(name, BASELINE_VERSION)
+        seeded = seed(container_ip(name))
+        stop(name)
+        name = f"mm-gate-{run_id}-upgraded"
+        names.append(name)
+        start(image, name, upgrade)
+        wait_ready(name, version)
+        verify(container_ip(name), seeded)
+        docker("restart", "-t", "60", name)
+        wait_ready(name, version)
+        verify(container_ip(name), seeded)
+        stop(name)
+
+        print("Registry", flush=True)
+        registry_tag_absent(tag)
+    finally:
+        for name in names:
+            docker("rm", "-f", name, check=False)
+        shutil.rmtree(work, ignore_errors=True)
+        if work.exists():
+            print(f"warning: could not remove {work}", file=sys.stderr)
+
+    print(f"PASS {image}")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except GateFailure as failure:
+        print(f"FAIL {failure}", file=sys.stderr)
+        sys.exit(1)

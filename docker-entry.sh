@@ -15,8 +15,8 @@ done
 if [ ! -f /etc/app_configured ]; then
     # Copy over files
     cd /mm || exit 1
-    wget https://releases.mattermost.com/11.3.0/mattermost-11.3.0-linux-amd64.tar.gz .
-    tar -zxvf ./mattermost-11.3.0-linux-amd64.tar.gz
+    wget https://releases.mattermost.com/12.0.0/mattermost-12.0.0-linux-amd64.tar.gz .
+    tar -zxvf ./mattermost-12.0.0-linux-amd64.tar.gz
 
     if [[ ! -f /mm/mattermost/config/config_docker.json ]]; then
         mv /config_docker.json /mm/mattermost/config/config_docker.json
