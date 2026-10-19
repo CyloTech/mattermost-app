@@ -5,10 +5,11 @@ Usage: ./release-gate repo.cylo.net/mattermost:<version>
 
 Run on the builder after `docker build` and before `docker push`. Exits 0
 only when the local image passes a fresh install, a restart, and an upgrade
-from the current production image on the same data, with every restart
-facing the stale Postgres lock file a killed container leaves behind, and
-the registry positively reports that the tag does not exist yet. Any other result,
-including an unreachable or ambiguous registry, exits non-zero.
+from the current production image on the same data; every stop of the image
+shuts Postgres down cleanly within the Appbox grace period, every restart
+also copes with the stale lock file a killed container leaves behind, and
+the registry positively reports that the tag does not exist yet. Any other
+result, including an unreachable or ambiguous registry, exits non-zero.
 """
 
 import http.client
@@ -35,6 +36,9 @@ BASELINE_IMAGE = (
 BASELINE_VERSION = "11.3.0"
 # Matches the catalogue limits for the app (2 GB memory, no extra swap).
 MEMORY_LIMIT = "2g"
+# serverapi stops containers with the image's stop signal and SIGKILLs them
+# after this many seconds.
+STOP_GRACE = 30
 START_TIMEOUT = 900
 # Postgres logs this when it refuses to start because of an existing lock
 # file, whether the file names a live process or holds unreadable data.
@@ -71,9 +75,24 @@ def start(image, name, data_dir):
     )
 
 
-def stop(name):
-    docker("stop", "-t", "60", name)
-    docker("rm", name)
+def stop_cleanly(name, data_dir):
+    """Stop the container as Appbox does and require a clean shutdown.
+
+    Postgres removes postmaster.pid only when it shuts down cleanly, so a
+    leftover file means it was killed at the end of the grace period.
+    """
+    began = time.monotonic()
+    docker("stop", "-t", str(STOP_GRACE), name)
+    took = time.monotonic() - began
+    status = docker("inspect", "-f", "{{.State.ExitCode}}", name).stdout.strip()
+    if (data_dir / "pg" / "postmaster.pid").exists():
+        raise GateFailure(
+            f"{name}: Postgres did not shut down cleanly ({took:.0f}s, "
+            f"exit {status})"
+        )
+    if status != "0":
+        raise GateFailure(f"{name}: exited {status} when stopped")
+    print(f"  {name} stopped cleanly in {took:.0f}s", flush=True)
 
 
 def leave_stale_lock(data_dir):
@@ -91,7 +110,7 @@ def leave_stale_lock(data_dir):
 
 
 def restart(name, data_dir, version):
-    docker("stop", "-t", "60", name)
+    stop_cleanly(name, data_dir)
     leave_stale_lock(data_dir)
     docker("start", name)
     wait_ready(name, version)
@@ -301,7 +320,8 @@ def main():
         seeded = seed(container_ip(name))
         restart(name, fresh, version)
         verify(container_ip(name), seeded)
-        stop(name)
+        stop_cleanly(name, fresh)
+        docker("rm", name)
 
         print(f"Upgrade from {BASELINE_VERSION}", flush=True)
         docker("pull", "-q", BASELINE_IMAGE)
@@ -313,7 +333,9 @@ def main():
         start(BASELINE_IMAGE, name, upgrade)
         wait_ready(name, BASELINE_VERSION)
         seeded = seed(container_ip(name))
-        stop(name)
+        # The baseline image cannot shut Postgres down cleanly.
+        docker("stop", "-t", str(STOP_GRACE), name)
+        docker("rm", name)
         leave_stale_lock(upgrade)
         name = f"mm-gate-{run_id}-upgraded"
         names.append(name)
@@ -322,7 +344,8 @@ def main():
         verify(container_ip(name), seeded)
         restart(name, upgrade, version)
         verify(container_ip(name), seeded)
-        stop(name)
+        stop_cleanly(name, upgrade)
+        docker("rm", name)
 
         print("Registry", flush=True)
         registry_tag_absent(tag)
