@@ -36,7 +36,9 @@ BASELINE_VERSION = "11.3.0"
 # Matches the catalogue limits for the app (2 GB memory, no extra swap).
 MEMORY_LIMIT = "2g"
 START_TIMEOUT = 900
-STALE_LOCK = 'lock file "postmaster.pid" already exists'
+# Postgres logs this when it refuses to start because of an existing lock
+# file, whether the file names a live process or holds unreadable data.
+STALE_LOCK = 'lock file "postmaster.pid"'
 IMAGE_RE = re.compile(
     r"^repo\.cylo\.net/mattermost:(?P<version>\d+\.\d+\.\d+)(?:-\d+)?$"
 )
@@ -75,16 +77,17 @@ def stop(name):
 
 
 def leave_stale_lock(data_dir):
-    """Point postmaster.pid at a live process, as a killed container can.
+    """Leave a postmaster.pid that Postgres will always refuse.
 
     Stopping the container kills Postgres without a clean shutdown, so its
-    lock file stays behind. Whether the old PID is in use on the next start
-    depends on timing; PID 1 (the container's init) always is, which makes
-    the check deterministic.
+    lock file stays behind. Postgres refuses it only when the old PID now
+    belongs to a live process of the postgres user, which depends on timing.
+    A PID of 0 is refused every time ("bogus data in lock file"), so the
+    container only starts if the entry script clears the file first.
     """
     pid_file = data_dir / "pg" / "postmaster.pid"
     lines = pid_file.read_text().splitlines() if pid_file.exists() else []
-    pid_file.write_text("\n".join(["1"] + lines[1:]) + "\n")
+    pid_file.write_text("\n".join(["0"] + lines[1:]) + "\n")
 
 
 def restart(name, data_dir, version):
