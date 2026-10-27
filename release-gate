@@ -71,6 +71,8 @@ STOP_GRACE = 30
 # The shared builder's disk is often busy; a first start (download, database
 # migrations, plugins) has taken over 12 minutes there.
 START_TIMEOUT = 1800
+# Creating the first team has taken longer than 15 seconds there too.
+API_TIMEOUT = 120
 # Postgres logs this when it refuses to start because of an existing lock
 # file, whether the file names a live process or holds unreadable data.
 STALE_LOCK = 'lock file "postmaster.pid"'
@@ -166,7 +168,7 @@ def api(ip, method, path, body=None, token=None):
     if token:
         req.add_header("Authorization", f"Bearer {token}")
     try:
-        with urllib.request.urlopen(req, timeout=15) as resp:
+        with urllib.request.urlopen(req, timeout=API_TIMEOUT) as resp:
             raw = resp.read()
             return resp.status, resp.headers, json.loads(raw) if raw else None
     except urllib.error.HTTPError as err:
