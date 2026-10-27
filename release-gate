@@ -4,19 +4,29 @@
 Usage: ./release-gate repo.cylo.net/mattermost:<version>
 
 Run on the builder after `docker build` and before `docker push`. Exits 0
-only when the local image passes a fresh install, a restart, and an upgrade
-from the current production image on the same data; every stop of the image
-shuts Postgres down cleanly within the Appbox grace period, every restart
-also copes with the stale lock file a killed container leaves behind, and
-the registry positively reports that the tag does not exist yet. Any other
-result, including an unreachable or ambiguous registry, exits non-zero.
+only when the local image passes two fresh installs, a restart, and upgrades
+from the 11.3.0 and 12.0.0-2 images on the same data; every stop of the
+image shuts Postgres down cleanly within the Appbox grace period, every
+restart also copes with the stale lock file a killed container leaves
+behind, and the registry positively reports that the tag does not exist yet.
+Any other result, including an unreachable or ambiguous registry, exits
+non-zero.
+
+Security checks: a fresh install has its own database password (in a 0600
+file and the DSN), Postgres refuses the old shared password and listens on
+127.0.0.1 only, the config holds none of the values older images shipped,
+and no secret appears in the logs, a command line or the image environment.
+An upgraded install keeps its DSN, link salt and pg_hba.conf, and Postgres
+stops listening on the container's network address.
 """
 
+import errno
 import http.client
 import json
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -27,19 +37,40 @@ from pathlib import Path
 
 REGISTRY = "repo.cylo.net"
 REPOSITORY = "mattermost"
-# The 11.3.0 image customers run today (published as :latest), pinned by
-# digest so the upgrade test always starts from the same release.
-BASELINE_IMAGE = (
-    "repo.cylo.net/mattermost@sha256:"
-    "a480b8c206102379058e397d7b66cfcb0cccf2916170cc25b3e34c23ab083c29"
-)
-BASELINE_VERSION = "11.3.0"
+# Images an existing install can be updated from, pinned by digest so the
+# upgrade tests always start from the same releases: the 11.3.0 image
+# customers run today (published as :latest) and the current default.
+BASELINES = [
+    ("11.3.0", "11.3.0", "repo.cylo.net/mattermost@sha256:"
+     "a480b8c206102379058e397d7b66cfcb0cccf2916170cc25b3e34c23ab083c29"),
+    ("12.0.0-2", "12.0.0", "repo.cylo.net/mattermost@sha256:"
+     "08ab78842342ab3c7a7807166c7712cf8ee575e4bf81e74dc11a43771a8c154e"),
+]
+# Every install made by the older images shares these. A new install must
+# not contain any of them.
+LEGACY_DB_PASSWORD = "mmdefault"
+LEGACY_SECRETS = {
+    LEGACY_DB_PASSWORD,
+    "7rAh6iwQCkV4cA1Gsg3fgGOXJAQ43QVg",  # SqlSettings.AtRestEncryptKey
+    "A705AklYF8MFDOfcwh3I488G8vtLlVip",  # FileSettings.PublicLinkSalt
+    "bjlSR4QqkXFBr7TP4oDzlfZmcNuH9YoS",  # EmailSettings.InviteSalt
+    "vZ4DcKyVVRlKHHJpexcuXzojkE5PZ5eL",  # EmailSettings.PasswordResetSalt
+}
+CONFIG = Path("mattermost/config/config_docker.json")  # in the /mm volume
+DB_PASSWORD_FILE = Path(".db_password")  # in the /mm volume
+DSN_RE = re.compile(r"^postgres://postgres:(?P<password>[^@]*)@127\.0\.0\.1:5432/")
+# /proc/net/tcp: port 5432 in hex, the LISTEN state and IPv4 127.0.0.1.
+PG_PORT_HEX = "1538"
+TCP_LISTEN = "0A"
+LOOPBACK_HEX = "0100007F"
 # Matches the catalogue limits for the app (2 GB memory, no extra swap).
 MEMORY_LIMIT = "2g"
 # serverapi stops containers with the image's stop signal and SIGKILLs them
 # after this many seconds.
 STOP_GRACE = 30
-START_TIMEOUT = 900
+# The shared builder's disk is often busy; a first start (download, database
+# migrations, plugins) has taken over 12 minutes there.
+START_TIMEOUT = 1800
 # Postgres logs this when it refuses to start because of an existing lock
 # file, whether the file names a live process or holds unreadable data.
 STALE_LOCK = 'lock file "postmaster.pid"'
@@ -249,6 +280,155 @@ def verify(ip, seeded):
         raise GateFailure("post content changed")
 
 
+def mm_config(data_dir):
+    return json.loads((data_dir / "mm" / CONFIG).read_text())
+
+
+def kept_state(data_dir):
+    """The per-install values an update or restart must not change."""
+    cfg = mm_config(data_dir)
+    return {
+        "dsn": cfg["SqlSettings"]["DataSource"],
+        "link_salt": cfg["FileSettings"].get("PublicLinkSalt"),
+        "at_rest_key": cfg["SqlSettings"].get("AtRestEncryptKey"),
+        "pg_hba": (data_dir / "pg" / "pg_hba.conf").read_bytes(),
+    }
+
+
+def postgres_listeners(name):
+    """Local addresses with a listening socket on port 5432."""
+    out = docker(
+        "exec", name, "sh", "-c", "cat /proc/net/tcp /proc/net/tcp6 2>/dev/null"
+    ).stdout
+    found = set()
+    for line in out.splitlines()[1:]:
+        fields = line.split()
+        if len(fields) < 4 or ":" not in fields[1]:
+            continue
+        address, port = fields[1].rsplit(":", 1)
+        if port == PG_PORT_HEX and fields[3] == TCP_LISTEN:
+            found.add(address)
+    if not found:
+        raise GateFailure(f"{name}: nothing listens on port 5432")
+    return found
+
+
+def postgres_reachable(ip):
+    """Whether port 5432 accepts a TCP connection on the container address."""
+    with socket.socket() as sock:
+        sock.settimeout(5)
+        result = sock.connect_ex((ip, 5432))
+    if result == 0:
+        return True
+    if result in (errno.ECONNREFUSED, errno.EHOSTUNREACH, errno.ETIMEDOUT,
+                  errno.EAGAIN):
+        return False
+    raise GateFailure(f"port 5432 check on {ip} indeterminate: errno {result}")
+
+
+def check_postgres_local_only(name):
+    listeners = postgres_listeners(name)
+    if listeners != {LOOPBACK_HEX}:
+        raise GateFailure(f"{name}: Postgres listens on {sorted(listeners)}")
+    if postgres_reachable(container_ip(name)):
+        raise GateFailure(f"{name}: Postgres accepts connections on the network")
+    print(f"  {name}: Postgres listens on 127.0.0.1 only", flush=True)
+
+
+def check_postgres_exposed(name):
+    """The old images listen on every address; proves the check can fail."""
+    if not postgres_reachable(container_ip(name)):
+        raise GateFailure(f"{name}: expected the old image to expose Postgres")
+    print(f"  {name}: Postgres reachable on the network (old image)", flush=True)
+
+
+def check_legacy_password_refused(name):
+    result = docker(
+        "exec", "-e", f"PGPASSWORD={LEGACY_DB_PASSWORD}",
+        "-e", "PGCONNECT_TIMEOUT=10", name,
+        "psql", "-h", "127.0.0.1", "-U", "postgres", "-d", "mattermost",
+        "-Atc", "select 1", check=False,
+    )
+    if result.returncode == 0:
+        raise GateFailure(f"{name}: Postgres accepted the old shared password")
+    if "password authentication failed" not in result.stderr:
+        raise GateFailure(
+            f"{name}: old password check indeterminate: {result.stderr.strip()}"
+        )
+    print(f"  {name}: Postgres refuses the old shared password", flush=True)
+
+
+def check_pg_hba_requires_password(data_dir):
+    for line in (data_dir / "pg" / "pg_hba.conf").read_text().splitlines():
+        fields = line.split("#", 1)[0].split()
+        if fields and fields[0].startswith("host") and fields[-1] == "trust":
+            raise GateFailure(f"pg_hba.conf trusts TCP connections: {line}")
+
+
+def check_not_exposed(name, data_dir, secret_values):
+    """No secret in the container log, Mattermost's log file, a process
+    command line or the container's configured environment."""
+    logs = docker("logs", name, check=False)
+    places = {"container log": logs.stdout + logs.stderr}
+    log_file = data_dir / "mm" / "mattermost" / "logs" / "mattermost.log"
+    if log_file.exists():
+        places["mattermost.log"] = log_file.read_text(errors="replace")
+    places["command lines"] = docker(
+        "exec", name, "sh", "-c",
+        "for p in /proc/[0-9]*; do tr '\\0' ' ' < $p/cmdline; echo; done",
+        check=False,
+    ).stdout
+    places["image environment"] = docker(
+        "inspect", "-f", "{{json .Config.Env}}", name
+    ).stdout
+    if "POSTGRES_PASSWORD=" in places["image environment"]:
+        raise GateFailure(f"{name}: POSTGRES_PASSWORD is set in the image")
+    for place, text in places.items():
+        for value in secret_values:
+            if value and value in text:
+                raise GateFailure(f"{name}: a secret appears in the {place}")
+    print(f"  {name}: no secret in logs, command lines or environment",
+          flush=True)
+
+
+def check_fresh_install(name, data_dir):
+    """Security state of a new install; returns its secrets."""
+    password_file = data_dir / "mm" / DB_PASSWORD_FILE
+    config_file = data_dir / "mm" / CONFIG
+    for path in (password_file, config_file):
+        info = path.stat()
+        if info.st_mode & 0o777 != 0o600 or info.st_uid != 1000:
+            raise GateFailure(
+                f"{path.name} is {oct(info.st_mode & 0o777)} uid {info.st_uid}, "
+                "expected 0600 uid 1000"
+            )
+    password = password_file.read_text()
+    if not re.fullmatch(r"[0-9a-f]{64}", password):
+        raise GateFailure("database password file has an unexpected format")
+    cfg = mm_config(data_dir)
+    match = DSN_RE.match(cfg["SqlSettings"]["DataSource"])
+    if not match or match["password"] != password:
+        raise GateFailure("the DSN does not use the install's database password")
+    text = config_file.read_text()
+    if any(value in text for value in LEGACY_SECRETS):
+        raise GateFailure("the config still holds a value older images shipped")
+    level = cfg["LogSettings"]["ConsoleLevel"]
+    if level != "INFO":
+        raise GateFailure(f"ConsoleLevel is {level}, expected INFO")
+    # The template has no salt; Mattermost generates one when it first loads
+    # the config and writes it back.
+    salt = cfg["FileSettings"].get("PublicLinkSalt") or ""
+    if len(salt) < 32:
+        raise GateFailure(f"{name}: Mattermost did not generate a link salt")
+    check_pg_hba_requires_password(data_dir)
+    check_postgres_local_only(name)
+    check_legacy_password_refused(name)
+    check_not_exposed(name, data_dir, [password, salt])
+    print(f"  {name}: own database password and link salt, no shared "
+          "values, INFO logs", flush=True)
+    return {"password": password, "link_salt": salt}
+
+
 def registry_tag_absent(tag):
     config = json.loads((Path.home() / ".docker" / "config.json").read_text())
     auth = config.get("auths", {}).get(REGISTRY, {}).get("auth")
@@ -308,44 +488,110 @@ def main():
     # test container OOM-killed, which never happens on Cylo storage.
     work = Path(tempfile.mkdtemp(prefix=".mattermost-gate.", dir=Path.cwd()))
     names = []
-    try:
-        print("Fresh install", flush=True)
-        fresh = work / "fresh"
-        (fresh / "mm").mkdir(parents=True)
-        (fresh / "pg").mkdir()
-        name = f"mm-gate-{run_id}-fresh"
-        names.append(name)
-        start(image, name, fresh)
-        wait_ready(name, version)
-        seeded = seed(container_ip(name))
-        restart(name, fresh, version)
-        verify(container_ip(name), seeded)
-        stop_cleanly(name, fresh)
-        docker("rm", name)
 
-        print(f"Upgrade from {BASELINE_VERSION}", flush=True)
-        docker("pull", "-q", BASELINE_IMAGE)
-        upgrade = work / "upgrade"
-        (upgrade / "mm").mkdir(parents=True)
-        (upgrade / "pg").mkdir()
-        name = f"mm-gate-{run_id}-baseline"
-        names.append(name)
-        start(BASELINE_IMAGE, name, upgrade)
-        wait_ready(name, BASELINE_VERSION)
-        seeded = seed(container_ip(name))
-        # The baseline image cannot shut Postgres down cleanly.
-        docker("stop", "-t", str(STOP_GRACE), name)
-        docker("rm", name)
-        leave_stale_lock(upgrade)
-        name = f"mm-gate-{run_id}-upgraded"
-        names.append(name)
-        start(image, name, upgrade)
-        wait_ready(name, version)
-        verify(container_ip(name), seeded)
-        restart(name, upgrade, version)
-        verify(container_ip(name), seeded)
-        stop_cleanly(name, upgrade)
-        docker("rm", name)
+    def fresh_dir(label):
+        path = work / label
+        (path / "mm").mkdir(parents=True)
+        (path / "pg").mkdir()
+        return path
+
+    try:
+        installs = []
+        for label in ("fresh-a", "fresh-b"):
+            print(f"Fresh install {label}", flush=True)
+            fresh = fresh_dir(label)
+            name = f"mm-gate-{run_id}-{label}"
+            names.append(name)
+            start(image, name, fresh)
+            wait_ready(name, version)
+            found = check_fresh_install(name, fresh)
+            installs.append(found)
+            if label == "fresh-a":
+                seeded = seed(container_ip(name))
+                state = kept_state(fresh)
+                restart(name, fresh, version)
+                verify(container_ip(name), seeded)
+                if kept_state(fresh) != state:
+                    raise GateFailure(f"{name}: a restart changed the config")
+                check_postgres_local_only(name)
+                check_not_exposed(
+                    name, fresh, [found["password"], found["link_salt"]]
+                )
+            stop_cleanly(name, fresh)
+            docker("rm", name)
+            shutil.rmtree(fresh, ignore_errors=True)
+        first, second = installs
+        if (first["password"] == second["password"]
+                or first["link_salt"] == second["link_salt"]):
+            raise GateFailure("two fresh installs share a password or salt")
+        print("  the two fresh installs have different passwords and salts",
+              flush=True)
+
+        for label, baseline_version, baseline_image in BASELINES:
+            print(f"Upgrade from {label}", flush=True)
+            docker("pull", "-q", baseline_image)
+            upgrade = fresh_dir(f"upgrade-{label}")
+            name = f"mm-gate-{run_id}-from-{label}"
+            names.append(name)
+            start(baseline_image, name, upgrade)
+            wait_ready(name, baseline_version)
+            seeded = seed(container_ip(name))
+            check_postgres_exposed(name)
+            before = kept_state(upgrade)
+            if not before["link_salt"]:
+                raise GateFailure(f"{name}: baseline has no link salt")
+            if mm_config(upgrade)["LogSettings"]["ConsoleLevel"] != "DEBUG":
+                raise GateFailure(f"{name}: baseline console level is not DEBUG")
+            shared = sorted(k for k in ("link_salt", "at_rest_key")
+                            if before[k] in LEGACY_SECRETS)
+            print(f"  {name}: values shared by all old installs: "
+                  f"{', '.join(shared) or 'none'}", flush=True)
+            # The 11.3.0 image cannot shut Postgres down cleanly.
+            docker("stop", "-t", str(STOP_GRACE), name)
+            docker("rm", name)
+            leave_stale_lock(upgrade)
+
+            name = f"mm-gate-{run_id}-upgraded-{label}"
+            names.append(name)
+            start(image, name, upgrade)
+            wait_ready(name, version)
+            verify(container_ip(name), seeded)
+            after = kept_state(upgrade)
+            for key in ("dsn", "link_salt", "pg_hba"):
+                if after[key] != before[key]:
+                    raise GateFailure(f"{name}: the update changed {key}")
+            # Mattermost 12 no longer has AtRestEncryptKey and drops it.
+            if after["at_rest_key"] not in (None, before["at_rest_key"]):
+                raise GateFailure(f"{name}: the update changed AtRestEncryptKey")
+            if (upgrade / "mm" / DB_PASSWORD_FILE).exists():
+                raise GateFailure(f"{name}: the update made a new password file")
+            level = mm_config(upgrade)["LogSettings"]["ConsoleLevel"]
+            if level != "INFO":
+                raise GateFailure(f"{name}: ConsoleLevel is {level}, expected INFO")
+            check_postgres_local_only(name)
+            print(f"  {name}: DSN, link salt and pg_hba.conf unchanged, "
+                  "INFO logs", flush=True)
+
+            # The owner can still choose DEBUG; the change to INFO is made once.
+            stop_cleanly(name, upgrade)
+            config_file = upgrade / "mm" / CONFIG
+            config_file.write_text(config_file.read_text().replace(
+                '"ConsoleLevel": "INFO"', '"ConsoleLevel": "DEBUG"'))
+            leave_stale_lock(upgrade)
+            docker("start", name)
+            wait_ready(name, version)
+            verify(container_ip(name), seeded)
+            level = mm_config(upgrade)["LogSettings"]["ConsoleLevel"]
+            if level != "DEBUG":
+                raise GateFailure(f"{name}: the owner's DEBUG level was reset")
+            after_restart = kept_state(upgrade)
+            if after_restart != after:
+                raise GateFailure(f"{name}: a restart changed the config")
+            check_postgres_local_only(name)
+            print(f"  {name}: restart kept the owner's console level", flush=True)
+            stop_cleanly(name, upgrade)
+            docker("rm", name)
+            shutil.rmtree(upgrade, ignore_errors=True)
 
         print("Registry", flush=True)
         registry_tag_absent(tag)
