@@ -4,7 +4,8 @@ FROM postgres:16
 
 RUN apt-get update && apt-get install -y ca-certificates wget curl
 
-ENV POSTGRES_PASSWORD=mmdefault
+# docker-entry.sh gives each new database its own password. Databases
+# created by older images keep theirs.
 ENV POSTGRES_DB=mattermost
 
 ADD config_docker.json /config_docker.json
